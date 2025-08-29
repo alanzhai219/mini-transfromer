@@ -12,7 +12,7 @@ SUPPORTED_ARCHES = ["LlamaForCausalLM"]
 
 string_dtype_map = {
     "fp32": torch.float32,
-    "fp16": torch.float16
+    "fp16": torch.float16,
     "fp8": torch.float8_e5m2
 }
 
@@ -22,7 +22,7 @@ class MetaData:
         if self.arch not in SUPPORTED_ARCHES:
             raise Exception(f"Archiectre {self.arch} is not supported for now. arch must be in {SUPPORTED_ARCHES}")
         self.dtype = dtype
-        if self.arch not in SUPPORTED_DTYPES:
+        if self.dtype not in SUPPORTED_DTYPES:
             raise Exception(f"Dtype {self.dtype} is not supported for now. arch must be in {SUPPORTED_DTYPES}")
         self.dim            = config["hidden_size"]
         self.hidden_dim     = config["intermediate_size"]
@@ -47,7 +47,7 @@ class MetaData:
         assert config.get("attention_bias", False) == False
         assert config.get("mlp_bias", False) == False
         # TODO moe
-        if arch in ["MixtralForCausalLM"]:
+        if self.arch in ["MixtralForCausalLM"]:
             self.n_experts = config["num_local_experts"]
             self.n_experts_active = config["num_experts_per_tok"]
 
@@ -113,17 +113,17 @@ def permute_reverse(w, heads, rotary_dim):
     wr = w[:, :rotray_dim]
     wk = w[:, rotary_dim:]
     
-    # 
+    # TODO
 
 def load_weights(model_files, dtype_str, metadata, tie_word_embeddings=False):
     weights = {}
     for model_path in model_files:
-        ext = os.path.splittext(model_path)[1]
+        ext = os.path.splitext(model_path)[1]
         if ext == ".safetensors":
             with safetensors.safe_open(model_path, framework="pt") as f:
                 for k in f.keys():
                     assert(k not in weights)
-                    weights[k] = f.get_tensor()
+                    weights[k] = f.get_tensor(k)
 
     dtype = string_dtype_map[dtype_str]
 
@@ -140,7 +140,35 @@ def load_weights(model_files, dtype_str, metadata, tie_word_embeddings=False):
 
     tensors = {}
     # convert embeding weight
-    tensors["model.embed.weight"] = cvt_type(weights["model.embed.weight"])
+    tensors["model.embed.weight"] = weights["model.embed_tokens.weight"].to(dtype)
+
+    for l in range(metadata.n_layers):
+        tensors[f"model.layers.{l}.attn.norm.weight"] = weights[f"model.layers.{l}.input_layernorm.weight"].float()
+
+        # q
+        tensors[f"model.layers.{l}.attn.wq.weight"] = weights[f"model.layers.{l}.self_attn.q_proj.weight"].to(dtype)
+        # k
+        tensors[f"model.layers.{l}.attn.wk.weight"] = weights[f"model.layers.{l}.self_attn.k_proj.weight"].to(dtype)
+        # v
+        tensors[f"model.layers.{l}.attn.wv.weight"] = weights[f"model.layers.{l}.self_attn.v_proj.weight"].to(dtype)
+        # o
+        tensors[f"model.layers.{l}.attn.wo.weight"] = weights[f"model.layers.{l}.self_attn.o_proj.weight"].to(dtype)
+
+        # norm
+        tensors[f"model.layers.{l}.mlp.norm.weight"] = weights[f"model.layers.{l}.post_attention_layernorm.weight"].float()
+
+        tensors[f"model.layers.{l}.mlp.w1.weight"] = weights[f"model.layers.{l}.mlp.gate_proj.weight"].to(dtype)
+        tensors[f"model.layers.{l}.mlp.w2.weight"] = weights[f"model.layers.{l}.mlp.down_proj.weight"].to(dtype)
+        tensors[f"model.layers.{l}.mlp.w2.weight"] = weights[f"model.layers.{l}.mlp.up_proj.weight"].to(dtype)
+
+    tensors[f"model.norm.weight"] = weights[f"model.norm.weight"].float()
+    if tie_word_embeddings == False:
+        tensors["model.output.weight"] = weights["lm_head.weight"].float()
+    else:
+        pass
+
+    return tensors
+
 
 
 if __name__ == "__main__":
@@ -168,8 +196,8 @@ if __name__ == "__main__":
         # get models of .safetensors format
         files = os.listdir(args.input)
         for fname in files:
-            if os.path.splittext(fname)[1] == ".safetensors":
-                models_list.append(fname)
+            if os.path.splitext(fname)[1] == ".safetensors":
+                models_list.append(os.path.join(args.input, fname))
         if len(models_list) == 0:
             raise ValueError("No .safetensors are found in {}".format(args.input))
     else:
@@ -181,7 +209,26 @@ if __name__ == "__main__":
     # read tokenizer.json
     tokens = load_tokenizer(tokenizer_json_file, metadata.vocab_size)
 
-
     # read *.safetensors
+    tensors = load_weights(models_list, args.dtype, metadata)
+
+    # addtional, add the token to the tensors in order to take good use of the whole file.
+    concatenated_tensors = []
+    for b in tokens:
+        # Convert each token in the sequence to a list and append 0
+        # token_list = [x for x in b] + [0]
+        token_list = []
+        for x in b:
+            token_list.append(x)
+        token_list.append(0)
+        # Convert the list to a tensor with dtype uint8
+        tensor = torch.tensor(token_list, dtype=torch.uint8)
+        # Append the tensor to the list
+        concatenated_tensors.append(tensor)
+    
+    # Concatenate all tensors in the list
+    tensors["tokenizer.tokens"] = torch.cat(concatenated_tensors)
 
     # save model
+    print(f"save model to {args.output}")
+    save_file(tensors, args.output, metadata.to_dict())
